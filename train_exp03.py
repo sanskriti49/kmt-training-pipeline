@@ -1,27 +1,34 @@
-"""train_exp03.py - EXPERIMENT 3: masked encoder + semi-hard, impostor-aware mining.
+"""train_exp03.py - EXPERIMENT 3: better negatives + padding-aware encoder.
 
-What changes vs baseline (Exp02 kept architecture/loss fixed; this changes
-HOW negatives are chosen and how sequences are pooled):
-  * model_v2: masked mean pooling (no padding dilution), LayerNorm fusion,
-    modality gate. Longer windows (key 96, mouse 256).
-  * batch semi-hard mining on TRAIN users only: embed a batch of P users x
-    G genuine trials (+ their targeted false_data trials), then per anchor
-    pick the hardest same-user positive and the hardest SEMI-HARD negative:
-      d(a,p) < d(a,n) < d(a,p) + margin, preferring same-user false_data
-      (targeted impostor) candidates first, cross-user genuine second.
-    Fallbacks (hardest available negative) keep every anchor informative.
-    Rationale: random sampling wastes most updates on zero-loss easy
-    triplets; semi-hard keeps gradients informative without the collapse
-    risk of pure hardest-mining.
-  * impostor-aware quota: at least --target_frac of mined negatives must be
-    same-user false_data (targeted attack model); the rest are cross-user
-    (zero-effort model). Both threat models stay represented.
-  * best-validation-AUC checkpointing, cosine LR, grad clip (as in Exp02).
-  * separate cache (kmt_cache_v3.pkl) with config guard: v2 preprocessing
-    differs (longer windows), so it must NEVER reuse the v2/v1 cache
-    silently. Separate output: kmt_multimodal_siamese_exp03.pth.
+Idea in one line: the baseline picks triplets at random, so most of them
+are too easy and teach the model nothing. Here we pick triplets the model
+currently finds confusing, with extra focus on targeted impostors
+(someone else typing the victim's own credentials).
 
-Usage (Colab T4):
+  * Encoder (model_v2): ignores zero-padding when averaging over time,
+    uses LayerNorm instead of BatchNorm in the fusion layer, and learns
+    a small gate that balances the keyboard and mouse branches.
+    Input windows are longer: 96 key rows, 256 mouse rows.
+  * Smarter triplets: each training batch embeds P users x G genuine trials
+    (plus their impostor trials), then for every genuine anchor we pick
+      - positive: the same user's trial that looks LEAST like the anchor
+      - negative: one that looks slightly MORE similar than the positive,
+        but not absurdly so ("semi-hard": harder than the positive, still
+        within one margin). Targeted impostors (same user's false_data)
+        are preferred; other users' trials fill the rest.
+    Why semi-hard: random negatives give zero loss (no learning), while
+    the very hardest negatives make training unstable. Semi-hard is the
+    middle ground that keeps every update useful.
+  * Attack mix (--target_frac, default 0.5): about half the negatives are
+    targeted impostors, half are other users. Both threat models stay
+    represented. Mining uses TRAIN users only, never val/test.
+  * Same safety rules as Exp02: best checkpoint picked on validation AUC,
+    threshold from validation only, test evaluated once at the end.
+  * Own cache file (kmt_cache_v3.pkl) with a settings check, so the new
+    longer-window preprocessing can never silently reuse the old cache.
+    Saves to kmt_multimodal_siamese_exp03.pth.
+
+Usage (in Colab):
   !python train_exp03.py --data /content/raw_kmt_dataset \\
       --epochs 35 --steps 32 --P 16 --G 4 --K 5
 """
@@ -90,16 +97,19 @@ def evaluate_few_shot_v2(model, samples, K=5, device="cpu"):
 
 def mine_batch(model, index, P: int, G: int, margin: float,
                target_frac: float, device):
-    """Build one mined triplet batch from TRAIN users only.
+    """Build one triplet batch, picking the most useful (semi-hard) negatives.
 
-    Returns stacked (ak, am, akl, aml, pk, ..., nk, ...) tensors + lengths.
-    Mining is done under no_grad; the returned triplets get a fresh
-    forward pass with gradients.
+    Only TRAIN users are ever used here. Distances are measured without
+    tracking gradients; the returned triplets are then re-embedded WITH
+    gradients for the actual learning step.
+    Returns stacked anchor/positive/negative tensors plus their lengths,
+    and the fraction of negatives that are targeted impostors.
     """
     gen, imp, users = index
     chosen = random.sample(users, min(P, len(users)))
-    # Gather: G genuine per user + up to G targeted impostor trials
-    items = []  # (sample, user, role) role: 0 genuine, 1 targeted impostor
+    # Collect G genuine trials per user, plus up to G impostor trials each.
+    # role 0 = genuine trial, role 1 = targeted impostor trial.
+    items = []
     for u in chosen:
         gs = random.sample(gen[u], min(G, len(gen[u])))
         items += [(s, u, 0) for s in gs]
@@ -116,33 +126,36 @@ def mine_batch(model, index, P: int, G: int, margin: float,
     RR = torch.tensor([r for _, _, r in items], device=device)
     with torch.no_grad():
         model.eval()
-        Z = model(K, M, KL, ML)  # L2-normalized
-        D = torch.cdist(Z, Z, p=2)
+        Z = model(K, M, KL, ML)  # embeddings are L2-normalized, so closer = more similar
+        D = torch.cdist(Z, Z, p=2)  # pairwise distances between every trial in the batch
     model.train()
     A, P_, N = [], [], []
     n_target = 0
     order = torch.randperm(len(items)).tolist()
     for i in order:
         if RR[i].item() != 0:
-            continue  # anchors are genuine trials only
+            continue  # only genuine trials can be anchors
         u = UU[i].item()
         pos = ((UU == u) & (RR == 0)).nonzero().flatten().tolist()
         pos = [j for j in pos if j != i]
         if not pos:
             continue
-        # hardest same-user positive
+        # Positive = the same-user trial furthest from the anchor (the one the model confuses most).
         p = max(pos, key=lambda j: D[i, j].item())
         d_ap = D[i, p].item()
-        # candidate negatives: targeted first, then cross-user
+        # Negative candidates: targeted impostors first (same user, role 1),
+        # other users' genuine trials second.
         targ = ((UU == u) & (RR == 1)).nonzero().flatten().tolist()
         cross = ((UU != u) & (RR == 0)).nonzero().flatten().tolist()
         want_target = (random.random() < target_frac) and targ
         cand = targ if want_target else cross
-        if not cand:  # fallback to whichever pool is non-empty
+        if not cand:  # if the preferred pool is empty, use whichever pool has trials
             cand = cross if cross else targ
         if not cand:
             continue
-        # semi-hard: d(a,p) < d(a,n) < d(a,p)+margin; else hardest available
+        # Semi-hard pick: a negative that is further than the positive but within
+        # one margin of it (confusing, yet learnable). If none qualifies, take the
+        # closest available negative so the anchor still teaches something.
         semi = [j for j in cand if d_ap < D[i, j].item() < d_ap + margin]
         n = min(semi, key=lambda j: D[i, j].item()) if semi else \
             min(cand, key=lambda j: D[i, j].item())
@@ -201,7 +214,7 @@ def main():
             pickle.dump({"config": cfg, "samples": all_samples}, f)
         print(f"[*] Parsed {len(all_samples)} v2 trials from JSON ({time.time()-t0:.1f}s), cached.")
 
-    # IDENTICAL split arithmetic to baseline (same seed)
+    # Same 52/16/20 subject-disjoint split as the baseline (same seed, same math).
     all_users = sorted({s.user_idx for s in all_samples})
     random.shuffle(all_users)
     n = len(all_users)
