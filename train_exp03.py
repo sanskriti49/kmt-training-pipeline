@@ -219,7 +219,7 @@ def main():
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs)
     loss_fn = nn.TripletMarginLoss(margin=a.margin, p=2.0)
 
-    print("\n" + "=" * 66 + "\n  EXP03: MASKED ENCODER + SEMI-HARD IMPOSTOR-AWARE MINING\n" + "=" * 66)
+    print("\n" + "=" * 66 + "\n  EXP03: MASKED ENCODER + IMPOSTOR-AWARE MINING\n" + "=" * 66)
     best_auc, best_ep = -1.0, -1
     for ep in range(1, a.epochs + 1):
         te0 = time.time()
